@@ -25,7 +25,7 @@ options = {defaultType = "swap"}# 默认合约交易
 [[strategies]]
 # LONG做多 SHORT做空
 direction = "LONG"
-gridCount = 3750
+gridCount = 2400
 leverage = 10
 lowerPrice = 50
 quantityPerGrid = 1
@@ -35,7 +35,7 @@ upperPrice = 200
 [[strategies]]
 # LONG做多 SHORT做空
 direction = "SHORT"
-gridCount = 3750
+gridCount = 2400
 leverage = 10
 lowerPrice = 50
 quantityPerGrid = 1

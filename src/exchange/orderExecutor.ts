@@ -8,9 +8,19 @@ import { logger } from "../utils/logger";
  */
 export class OrderExecutor {
   private exchange: ExchangeManager;
+  // 本地订单缓存：StratKey -> Set<OrderID>
+  // 用于辅助 syncActiveOrders，防止在并发极高时重复挂单
+  private localOrderCache: Record<string, Set<string>> = {};
 
   constructor() {
     this.exchange = ExchangeManager.getInstance();
+  }
+
+  /**
+   * 获取策略缓存 Key
+   */
+  private getCacheKey(symbol: string, direction: GridDirection): string {
+    return `${symbol}_${direction}`;
   }
 
   /**
@@ -139,6 +149,11 @@ export class OrderExecutor {
     targetLevels: { price: number; amount: number; action: "open" | "close" }[]
   ) {
     try {
+      const cacheKey = this.getCacheKey(symbol, direction);
+      if (!this.localOrderCache[cacheKey]) {
+        this.localOrderCache[cacheKey] = new Set();
+      }
+
       // 1. 获取当前所有挂单
       const openOrders = await this.exchange.client.fetchOpenOrders(symbol);
 
@@ -152,6 +167,14 @@ export class OrderExecutor {
           o.info.posSide || (o.side === "buy" ? "long" : "short");
         return orderPosSide === targetPosSide;
       });
+
+      // 2.5 同步本地缓存（移除那些已经不在 fetchOpenOrders 里的订单）
+      const remoteIds = new Set(currentStrategyOrders.map((o: any) => o.id));
+      for (const cachedId of this.localOrderCache[cacheKey]) {
+        if (!remoteIds.has(cachedId)) {
+          this.localOrderCache[cacheKey].delete(cachedId);
+        }
+      }
 
       // 3. 增量同步逻辑
       const ordersToKeep: any[] = [];
@@ -217,7 +240,15 @@ export class OrderExecutor {
       if (batchCreates.length > 0) {
         logger.info(`[OrderExecutor] 批量创建订单: ${batchCreates.length} 笔`);
         try {
-          await this.exchange.client.createOrders(batchCreates);
+          const newOrders = await this.exchange.client.createOrders(
+            batchCreates
+          );
+          // 将新创建的订单 ID 加入缓存
+          if (Array.isArray(newOrders)) {
+            for (const o of newOrders) {
+              this.localOrderCache[cacheKey].add(o.id);
+            }
+          }
         } catch (e: any) {
           logger.error(`[OrderExecutor] 批量创建失败: ${e.message}`);
           // 捕获“无仓位”等特定错误并上抛

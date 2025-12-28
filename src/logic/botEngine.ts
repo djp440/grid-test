@@ -1,3 +1,4 @@
+import { Mutex } from "async-mutex";
 import { ExchangeManager } from "../exchange/exchangeManager";
 import { OrderExecutor } from "../exchange/orderExecutor";
 import { GridContext } from "./gridContext";
@@ -18,9 +19,22 @@ export class BotEngine {
   private anchorIndices: Record<string, number> = {};
   // 记录每个策略是否因为“无仓位”而暂时禁用了平仓挂单
   private isCloseDisabled: Record<string, boolean> = {};
+  // 策略互斥锁，防止并发同步导致的重复挂单
+  private stratLocks: Record<string, Mutex> = {};
+
   // 辅助函数：生成策略的唯一标识 Key
   private getStratKey(symbol: string, direction: GridDirection): string {
     return `${symbol}_${direction}`;
+  }
+
+  /**
+   * 获取或创建策略锁
+   */
+  private getLock(stratKey: string): Mutex {
+    if (!this.stratLocks[stratKey]) {
+      this.stratLocks[stratKey] = new Mutex();
+    }
+    return this.stratLocks[stratKey];
   }
 
   constructor() {
@@ -101,81 +115,94 @@ export class BotEngine {
   private async refreshGridOrdersByAnchor(ctx: GridContext): Promise<void> {
     const config = ctx.getConfig();
     const stratKey = this.getStratKey(config.symbol, config.direction);
-    const anchorIndex = this.anchorIndices[stratKey];
-    const levels = ctx.getLevels();
 
-    if (anchorIndex === undefined) return;
+    // 使用互斥锁确保同一策略不会并发执行同步
+    const release = await this.getLock(stratKey).acquire();
 
-    // 1. 移除前置 fetchPositions，提高响应速度
-    // 2. 计算挂单窗口
-    const appConfig = ConfigLoader.getInstance().getConfig();
-    const windowSize = appConfig.default.order_window || 1;
+    try {
+      let retrySync = true;
+      while (retrySync) {
+        retrySync = false;
+        const anchorIndex = this.anchorIndices[stratKey];
+        const levels = ctx.getLevels();
 
-    const targets = [];
+        if (anchorIndex === undefined) break;
 
-    // 下方挂单窗口 (买单区)
-    for (let i = 1; i <= windowSize; i++) {
-      const idx = anchorIndex - i;
-      if (idx < 0) break;
+        // 1. 计算挂单窗口
+        const appConfig = ConfigLoader.getInstance().getConfig();
+        const windowSize = appConfig.default.order_window || 1;
+        const targets = [];
 
-      targets.push({
-        price: levels[idx].price,
-        amount: config.quantityPerGrid,
-        action:
-          config.direction === GridDirection.LONG
-            ? ("open" as const)
-            : ("close" as const),
-      });
-    }
+        // 下方挂单窗口 (买单区)
+        for (let i = 1; i <= windowSize; i++) {
+          const idx = anchorIndex - i;
+          if (idx < 0) break;
 
-    // 上方挂单窗口 (卖单区)
-    for (let i = 1; i <= windowSize; i++) {
-      const idx = anchorIndex + i;
-      if (idx >= levels.length) break;
+          targets.push({
+            price: levels[idx].price,
+            amount: config.quantityPerGrid,
+            action:
+              config.direction === GridDirection.LONG
+                ? ("open" as const)
+                : ("close" as const),
+          });
+        }
 
-      // 如果是 LONG 策略的平仓单，且当前未被禁用，则尝试挂单
-      const isLongClose = config.direction === GridDirection.LONG;
-      if (isLongClose && this.isCloseDisabled[stratKey]) {
-        continue;
-      }
+        // 上方挂单窗口 (卖单区)
+        for (let i = 1; i <= windowSize; i++) {
+          const idx = anchorIndex + i;
+          if (idx >= levels.length) break;
 
-      targets.push({
-        price: levels[idx].price,
-        amount: config.quantityPerGrid,
-        action: isLongClose ? ("close" as const) : ("open" as const),
-      });
-    }
-    // 下方挂单窗口中的平仓单 (SHORT 策略)
-    for (let i = 0; i < targets.length; i++) {
-      const t = targets[i];
-      if (config.direction === GridDirection.SHORT && t.action === "close") {
-        if (this.isCloseDisabled[stratKey]) {
-          targets.splice(i, 1);
-          i--;
+          const isLongClose = config.direction === GridDirection.LONG;
+          if (isLongClose && this.isCloseDisabled[stratKey]) {
+            continue;
+          }
+
+          targets.push({
+            price: levels[idx].price,
+            amount: config.quantityPerGrid,
+            action: isLongClose ? ("close" as const) : ("open" as const),
+          });
+        }
+
+        // 下方挂单窗口中的平仓单 (SHORT 策略) 过滤
+        for (let i = 0; i < targets.length; i++) {
+          const t = targets[i];
+          if (
+            config.direction === GridDirection.SHORT &&
+            t.action === "close"
+          ) {
+            if (this.isCloseDisabled[stratKey]) {
+              targets.splice(i, 1);
+              i--;
+            }
+          }
+        }
+
+        logger.info(
+          `[BotEngine] [${config.symbol}] [${config.direction}] 锚点: ${anchorIndex} (${levels[anchorIndex].price}) | 执行同步...`
+        );
+
+        try {
+          await this.executor.syncActiveOrders(
+            config.symbol,
+            config.direction,
+            targets
+          );
+        } catch (error: any) {
+          if (error.code === "NO_POSITION") {
+            logger.warn(
+              `[BotEngine] [${config.symbol}] [${config.direction}] 检测到无仓位平仓报错，暂时禁用平仓挂单并重试`
+            );
+            this.isCloseDisabled[stratKey] = true;
+            retrySync = true; // 循环重试，避免递归导致的死锁
+          } else {
+            throw error;
+          }
         }
       }
-    }
-
-    logger.info(
-      `[BotEngine] [${config.symbol}] [${config.direction}] 锚点: ${anchorIndex} (${levels[anchorIndex].price}) | 执行同步...`
-    );
-    try {
-      await this.executor.syncActiveOrders(
-        config.symbol,
-        config.direction,
-        targets
-      );
-    } catch (error: any) {
-      if (error.code === "NO_POSITION") {
-        logger.warn(
-          `[BotEngine] [${config.symbol}] [${config.direction}] 检测到无仓位平仓报错，暂时禁用平仓挂单`
-        );
-        this.isCloseDisabled[stratKey] = true;
-        // 立即重试一次同步（此时会过滤掉平仓单）
-        await this.refreshGridOrdersByAnchor(ctx);
-      } else {
-        throw error;
-      }
+    } finally {
+      release();
     }
   }
 
