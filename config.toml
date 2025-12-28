@@ -1,0 +1,43 @@
+# 交易模式：real (实盘) 或 simulation (模拟盘)
+mode = "simulation"
+
+[logger]
+console = true 
+dir = "logs" 
+file = true 
+level = "info" # info, warn, error
+
+[default]
+# 通用网格配置
+cancel_all_on_stop = true # 退出时自动撤单
+close_all_on_stop = false # 退出时自动平仓 (默认关闭，请谨慎开启)
+follow_market_on_fill = true # 开启成交后跟随市价锚定
+grid_count = 100 
+leverage = 10 
+order_window = 3 # 上下各挂 3 单
+
+[[exchanges]]
+enable = true
+name = "bitget"
+# 交易对配置将在策略启动时加载，这里仅作为连接配置
+options = {defaultType = "swap"}# 默认合约交易
+
+[[strategies]]
+# LONG做多 SHORT做空
+direction = "LONG"
+gridCount = 3750
+leverage = 10
+lowerPrice = 50
+quantityPerGrid = 1
+symbol = "SOL/USDT:USDT"
+upperPrice = 200
+
+[[strategies]]
+# LONG做多 SHORT做空
+direction = "SHORT"
+gridCount = 3750
+leverage = 10
+lowerPrice = 50
+quantityPerGrid = 1
+symbol = "SOL/USDT:USDT"
+upperPrice = 200
