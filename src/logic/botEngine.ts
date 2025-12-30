@@ -78,7 +78,7 @@ export class BotEngine {
       const targetSide =
         config.direction === GridDirection.LONG ? "long" : "short";
       const existingPosition = positions.find(
-        p => p.symbol === config.symbol && p.side === targetSide
+        (p: any) => p.symbol === config.symbol && p.side === targetSide
       );
 
       if (existingPosition && existingPosition.contracts > 0) {
