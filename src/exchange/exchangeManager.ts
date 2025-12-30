@@ -97,4 +97,39 @@ export class ExchangeManager {
     }
     return market;
   }
+
+  /**
+   * 获取价格最小跳动单位 (Tick Size)
+   */
+  public getTickSize(symbol: string): number {
+    const market = this.getMarket(symbol);
+    // CCXT 的 precision.price 可能是小数 (tickSize) 也可能是整数 (decimals)
+    // 取决于 precisionMode。但通常 safe way 是看 precision.price
+    // 如果是 bitget，通常是小数形式的 tickSize
+    // 为了稳健，我们可以检查一下
+    const pricePrecision = market.precision.price;
+
+    if (typeof pricePrecision === "number") {
+      const mode = this.client.precisionMode;
+      // CCXT constants are not exported in types, so we cast or use values
+      // TICK_SIZE = 4, DECIMAL_PLACES = 2, SIGNIFICANT_DIGITS = 3
+      if (mode === (ccxt as any).TICK_SIZE) {
+        return pricePrecision;
+      } else if (mode === (ccxt as any).DECIMAL_PLACES) {
+        return Math.pow(10, -pricePrecision);
+      } else if (mode === (ccxt as any).SIGNIFICANT_DIGITS) {
+        // 这种情况比较少见用于 crypto spot/swap price
+        return 0.00000001; // Fallback
+      }
+    }
+
+    // 如果上面都没匹配，尝试直接读 info (Bitget 原生字段)
+    if (market.info && market.info.pricePlace) {
+      // Bitget v1
+      return Math.pow(10, -parseInt(market.info.pricePlace));
+    }
+
+    // Fallback default
+    return 0.00000001;
+  }
 }

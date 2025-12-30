@@ -12,7 +12,7 @@ export interface GridConfig {
   leverage: number; // 杠杆
   upperPrice: number; // 网格上限
   lowerPrice: number; // 网格下限
-  gridCount: number; // 格子数量 (刻度数 = gridCount + 1)
+  gridSpread: number; // 网格间距百分比 (例如 0.01 代表 1%)
   quantityPerGrid: number; // 每格下单数量
 }
 

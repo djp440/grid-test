@@ -7,14 +7,17 @@ dir = "logs"
 file = true 
 level = "info" # info, warn, error
 
+[monitor]
+interval_seconds = 900 # 默认 1 小时执行一次权益记录和绘图
+
 [default]
 # 通用网格配置
+auto_initial_position = true # 是否自动计算并市价建仓 (警告：开启后将自动市价买入/卖出，并禁用锚点重置)
 cancel_all_on_stop = true # 退出时自动撤单
 close_all_on_stop = false # 退出时自动平仓 (默认关闭，请谨慎开启)
 follow_market_on_fill = true # 开启成交后跟随市价锚定
-grid_count = 100 
 leverage = 10 
-order_window = 3 # 上下各挂 3 单
+order_window = 10 # 上下各挂 3 单
 
 [[exchanges]]
 enable = true
@@ -25,19 +28,19 @@ options = {defaultType = "swap"}# 默认合约交易
 [[strategies]]
 # LONG做多 SHORT做空
 direction = "LONG"
-gridCount = 2400
+gridSpread = 0.0005
 leverage = 10
-lowerPrice = 50
-quantityPerGrid = 1
+lowerPrice = 100
+quantityPerGrid = 0.2
 symbol = "SOL/USDT:USDT"
-upperPrice = 200
+upperPrice = 150
 
 [[strategies]]
 # LONG做多 SHORT做空
 direction = "SHORT"
-gridCount = 2400
+gridSpread = 0.0005
 leverage = 10
-lowerPrice = 50
-quantityPerGrid = 1
+lowerPrice = 100
+quantityPerGrid = 0.2
 symbol = "SOL/USDT:USDT"
-upperPrice = 200
+upperPrice = 150

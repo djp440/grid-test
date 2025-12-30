@@ -27,8 +27,9 @@ export class GridContext {
 
   /**
    * 初始化网格：计算刻度并保存/加载 CSV
+   * @param tickSize 交易所的价格最小跳动单位 (例如 0.01)
    */
-  public async initialize(): Promise<void> {
+  public async initialize(tickSize: number): Promise<void> {
     if (fs.existsSync(this.csvPath)) {
       const isConfigMatched = this.checkConfigMatch();
       if (isConfigMatched) {
@@ -45,9 +46,9 @@ export class GridContext {
     }
 
     logger.info(
-      `[GridContext] 开始计算等差网格: ${this.config.symbol} ${this.config.direction}`
+      `[GridContext] 开始计算等比网格: ${this.config.symbol} ${this.config.direction}`
     );
-    this.calculateLevels();
+    this.calculateLevels(tickSize);
     this.saveToCsv();
   }
 
@@ -63,12 +64,12 @@ export class GridContext {
       }
 
       const configStr = firstLine.replace("# config:", "");
-      const [upper, lower, count] = configStr.split(",").map(Number);
+      const [upper, lower, spread] = configStr.split(",").map(Number);
 
       return (
         upper === this.config.upperPrice &&
         lower === this.config.lowerPrice &&
-        count === this.config.gridCount
+        spread === this.config.gridSpread
       );
     } catch (error) {
       return false;
@@ -76,18 +77,38 @@ export class GridContext {
   }
 
   /**
-   * 计算等差网格刻度
+   * 计算等比网格刻度
    */
-  private calculateLevels(): void {
-    const { upperPrice, lowerPrice, gridCount } = this.config;
-    const diff = (upperPrice - lowerPrice) / gridCount;
+  private calculateLevels(tickSize: number): void {
+    const { upperPrice, lowerPrice, gridSpread } = this.config;
 
     this.levels = [];
-    for (let i = 0; i <= gridCount; i++) {
-      const price = lowerPrice + i * diff;
+    let currentPrice = lowerPrice;
+    let index = 0;
+
+    // 辅助函数：将价格对齐到 Tick Size
+    // 使用 Math.round 而不是 floor/ceil，确保最接近理论值
+    const roundToTick = (p: number) => {
+      const precision = 1 / tickSize;
+      return Math.round(p * precision) / precision;
+    };
+
+    // 添加第一个刻度
+    this.levels.push({
+      index: index,
+      price: roundToTick(currentPrice),
+      buyOrderId: "",
+      sellOrderId: "",
+    });
+
+    // 循环生成后续刻度，直到超过上限
+    while (currentPrice < upperPrice) {
+      index++;
+      currentPrice = currentPrice * (1 + gridSpread);
+
       this.levels.push({
-        index: i,
-        price: parseFloat(price.toFixed(8)), // 避免浮点数精度问题
+        index: index,
+        price: roundToTick(currentPrice),
         buyOrderId: "",
         sellOrderId: "",
       });
@@ -98,7 +119,7 @@ export class GridContext {
    * 保存到 CSV
    */
   private saveToCsv(): void {
-    const configMeta = `# config:${this.config.upperPrice},${this.config.lowerPrice},${this.config.gridCount}\n`;
+    const configMeta = `# config:${this.config.upperPrice},${this.config.lowerPrice},${this.config.gridSpread}\n`;
     const header = "index,price,buy_order_id,sell_order_id\n";
     const rows = this.levels
       .map(l => `${l.index},${l.price},${l.buyOrderId},${l.sellOrderId}`)

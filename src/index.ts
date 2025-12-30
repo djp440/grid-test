@@ -1,6 +1,7 @@
 import { ConfigLoader } from "./config/configLoader";
 import { logger } from "./utils/logger";
 import { BotEngine } from "./logic/botEngine";
+import { EquityMonitor } from "./utils/equityMonitor";
 
 async function main() {
   try {
@@ -30,6 +31,10 @@ async function main() {
 
     // 3. 运行引擎
     await engine.start();
+
+    // 4. 启动权益监控
+    const monitor = new EquityMonitor();
+    monitor.start();
   } catch (error: any) {
     logger.error("程序启动时发生致命错误:", error);
     process.exit(1);

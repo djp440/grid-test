@@ -5,6 +5,7 @@ import { GridContext } from "./gridContext";
 import { ConfigLoader } from "../config/configLoader";
 import { logger } from "../utils/logger";
 import { GridDirection } from "../types/grid";
+import * as readline from "readline";
 
 /**
  * BotEngine 核心引擎
@@ -17,6 +18,8 @@ export class BotEngine {
   private isRunning: boolean = false;
   // 记录每个策略当前的锚点索引 (Anchor Index)
   private anchorIndices: Record<string, number> = {};
+  // 记录每个策略上次锚点重置的时间戳，用于冷却
+  private lastAnchorResetTime: Record<string, number> = {};
   // 记录每个策略是否因为“无仓位”而暂时禁用了平仓挂单
   private isCloseDisabled: Record<string, boolean> = {};
   // 策略互斥锁，防止并发同步导致的重复挂单
@@ -43,6 +46,130 @@ export class BotEngine {
   }
 
   /**
+   * 交互式确认
+   */
+  private async askConfirmation(message: string): Promise<boolean> {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    return new Promise(resolve => {
+      rl.question(`${message} (Y/N): `, answer => {
+        rl.close();
+        resolve(answer.trim().toUpperCase() === "Y");
+      });
+    });
+  }
+
+  /**
+   * 检查并自动构建底仓
+   */
+  private async checkAndBuildInitialPosition(ctx: GridContext): Promise<void> {
+    const appConfig = ConfigLoader.getInstance().getConfig();
+    if (!appConfig.default.auto_initial_position) return;
+
+    const config = ctx.getConfig();
+
+    // Check existing position
+    try {
+      const positions = await this.exchange.client.fetchPositions([
+        config.symbol,
+      ]);
+      const targetSide =
+        config.direction === GridDirection.LONG ? "long" : "short";
+      const existingPosition = positions.find(
+        p => p.symbol === config.symbol && p.side === targetSide
+      );
+
+      if (existingPosition && existingPosition.contracts > 0) {
+        logger.info(
+          `[BotEngine] [${config.symbol}] [AutoInit] 检测到已有 ${targetSide} 仓位 (${existingPosition.contracts})，跳过自动建仓`
+        );
+        return;
+      }
+    } catch (e: any) {
+      logger.warn(
+        `[BotEngine] [${config.symbol}] [AutoInit] 检查持仓失败，跳过自动建仓: ${e.message}`
+      );
+      return;
+    }
+
+    const ticker = await this.exchange.client.fetchTicker(config.symbol);
+    const currentPrice = ticker.last;
+
+    // Calculate required position
+    const levels = ctx.getLevels();
+    let requiredQty = 0;
+
+    if (config.direction === GridDirection.LONG) {
+      // LONG: 价格 > 当前价的部分需要有持仓才能挂卖单
+      for (const level of levels) {
+        if (level.price > currentPrice) {
+          requiredQty += config.quantityPerGrid;
+        }
+      }
+    } else {
+      // SHORT: 价格 < 当前价的部分需要有空单持仓才能挂买单(平空)
+      for (const level of levels) {
+        if (level.price < currentPrice) {
+          requiredQty += config.quantityPerGrid;
+        }
+      }
+    }
+
+    if (requiredQty <= 0) return;
+
+    logger.info(
+      `[BotEngine] [${config.symbol}] [AutoInit] 需建仓数量: ${requiredQty}`
+    );
+
+    // Check Equity
+    const balance = await this.exchange.client.fetchBalance();
+    const equity = balance["USDT"]
+      ? balance["USDT"].total
+      : balance.total["USDT"] || 0;
+
+    const leverage = config.leverage || 1;
+    const positionValue = requiredQty * currentPrice;
+    // 阈值: (权益 * 杠杆) / 2
+    const threshold = (equity * leverage) / 2;
+
+    if (positionValue > threshold) {
+      logger.warn(
+        `[BotEngine] [${
+          config.symbol
+        }] [AutoInit] 警告: 所需仓位价值 (${positionValue.toFixed(
+          2
+        )}) 超过账户权益*杠杆的一半 (${threshold.toFixed(2)})`
+      );
+      const confirm = await this.askConfirmation(
+        `确认要继续市价建仓吗? 数量: ${requiredQty}, 预计花费: ${positionValue.toFixed(
+          2
+        )} USDT`
+      );
+      if (!confirm) {
+        logger.info(`[BotEngine] 用户取消建仓，停止运行`);
+        process.exit(0);
+      }
+    }
+
+    // Execute Market Order
+    logger.info(
+      `[BotEngine] [${config.symbol}] [AutoInit] 正在执行市价建仓...`
+    );
+    try {
+      const side = config.direction === GridDirection.LONG ? "buy" : "sell";
+      await this.executor.placeMarketOrder(config.symbol, side, requiredQty);
+      logger.info(`[BotEngine] [${config.symbol}] [AutoInit] 市价建仓完成`);
+    } catch (e: any) {
+      logger.error(
+        `[BotEngine] [${config.symbol}] [AutoInit] 建仓失败: ${e.message}`
+      );
+      throw e;
+    }
+  }
+
+  /**
    * 启动引擎
    */
   public async start(): Promise<void> {
@@ -57,9 +184,16 @@ export class BotEngine {
 
       // 为每个启用的策略初始化 GridContext
       for (const strat of config.strategies) {
+        // 获取 Tick Size
+        const tickSize = this.exchange.getTickSize(strat.symbol);
+        logger.info(`[BotEngine] [${strat.symbol}] Tick Size: ${tickSize}`);
+
         const ctx = new GridContext(strat);
-        await ctx.initialize();
+        await ctx.initialize(tickSize);
         this.gridContexts.push(ctx);
+
+        // 检查并自动构建底仓
+        await this.checkAndBuildInitialPosition(ctx);
 
         // 初始挂单同步
         await this.initialPositioning(ctx);
@@ -358,6 +492,17 @@ export class BotEngine {
    * 并行价格监听循环：每个策略独立运行，实现积极锚点追随
    */
   private async watchTickerLoop(ctx: GridContext): Promise<void> {
+    const appConfig = ConfigLoader.getInstance().getConfig();
+    // 如果开启了自动建仓模式，则禁用锚点重置特性
+    if (appConfig.default.auto_initial_position) {
+      logger.info(
+        `[BotEngine] [${
+          ctx.getConfig().symbol
+        }] 自动建仓模式已开启，禁用锚点重置监听`
+      );
+      return;
+    }
+
     const config = ctx.getConfig();
     const stratKey = this.getStratKey(config.symbol, config.direction);
 
@@ -375,10 +520,38 @@ export class BotEngine {
 
         /**
          * 积极追随逻辑：
-         * 只要价格超出了当前锚点上下最近的一个刻度 (gridDiff * 1.0)，
-         * 且没有触发成交（成交会通过 watchOrders 更新锚点），就执行重置。
+         * 防止价格在网格间隙中大幅波动而没有触发订单（例如跳空或订单未成交）。
+         *
+         * 修正：
+         * 1. 动态计算当前价格附近的 gridDiff (等比网格中，高价位的 gridDiff 比低价位大)。
+         * 2. 增加阈值到 2.0 倍 gridDiff，避免在网格边缘频繁震荡。
+         * 3. 增加时间冷却 (Cooldown)，避免短时间内连续重置。
          */
-        if (Math.abs(currentPrice - anchorPrice) > gridDiff * 1.05) {
+
+        // 动态获取当前锚点附近的网格间距
+        let currentGridDiff = 0;
+        if (anchorIdx < levels.length - 1) {
+          currentGridDiff =
+            levels[anchorIdx + 1].price - levels[anchorIdx].price;
+        } else if (anchorIdx > 0) {
+          currentGridDiff =
+            levels[anchorIdx].price - levels[anchorIdx - 1].price;
+        } else {
+          // Fallback (极少情况)
+          currentGridDiff = levels[1].price - levels[0].price;
+        }
+
+        // 阈值设为 2 倍间距，提供足够的缓冲区
+        const threshold = currentGridDiff * 2.0;
+
+        if (Math.abs(currentPrice - anchorPrice) > threshold) {
+          // 检查冷却时间 (5秒)
+          const now = Date.now();
+          const lastReset = this.lastAnchorResetTime[stratKey] || 0;
+          if (now - lastReset < 5000) {
+            continue;
+          }
+
           const nearest = ctx.getNearestLevels(currentPrice);
           if (nearest) {
             // 选取最接近当前价格的刻度作为新锚点
@@ -390,9 +563,14 @@ export class BotEngine {
 
             if (newAnchor !== anchorIdx) {
               logger.info(
-                `[BotEngine] [${config.symbol}] [${config.direction}] 价格漂移 (${currentPrice})，积极重置锚点: ${anchorIdx} -> ${newAnchor}`
+                `[BotEngine] [${config.symbol}] [${
+                  config.direction
+                }] 价格漂移 (${currentPrice})，积极重置锚点: ${anchorIdx} -> ${newAnchor} (Diff: ${currentGridDiff.toFixed(
+                  4
+                )}, Thr: ${threshold.toFixed(4)})`
               );
               this.anchorIndices[stratKey] = newAnchor;
+              this.lastAnchorResetTime[stratKey] = now;
               await this.refreshGridOrdersByAnchor(ctx);
             }
           }

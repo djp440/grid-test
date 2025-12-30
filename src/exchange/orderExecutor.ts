@@ -101,6 +101,40 @@ export class OrderExecutor {
   }
 
   /**
+   * 执行市价建仓 (用于自动底仓构建)
+   */
+  public async placeMarketOrder(
+    symbol: string,
+    side: "buy" | "sell",
+    amount: number
+  ) {
+    // 市价单，假设是开仓 (Initial Position)
+    // Bitget Hedge Mode 需要 tradeSide
+    const params = {
+      tradeSide: "open",
+    };
+
+    try {
+      logger.info(
+        `[OrderExecutor] 执行市价建仓: ${symbol} | Side: ${side} | 数量: ${amount}`
+      );
+      const order = await this.exchange.client.createOrder(
+        symbol,
+        "market",
+        side,
+        amount,
+        undefined, // Price undefined for market
+        params
+      );
+      logger.info(`[OrderExecutor] 市价建仓成功: ID ${order.id}`);
+      return order;
+    } catch (error: any) {
+      logger.error(`[OrderExecutor] 市价建仓失败: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
    * 撤销指定交易对的所有活跃订单
    */
   public async cancelAllOrders(symbol: string) {
